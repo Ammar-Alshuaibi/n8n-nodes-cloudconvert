@@ -1,0 +1,50 @@
+{
+	"name": "n8n-nodes-cloudconvert-complete",
+	"version": "1.0.0",
+	"description": "n8n community node for CloudConvert - File conversion API",
+	"keywords": [
+		"n8n-community-node-package",
+		"n8n",
+		"cloudconvert",
+		"file-conversion",
+		"pdf",
+		"convert",
+		"api"
+	],
+	"license": "MIT",
+	"homepage": "https://github.com/Ammar-Alshuaibi/n8n-nodes-cloudconvert",
+	"author": {
+		"name": "Ammar Alshuaibi"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Ammar-Alshuaibi/n8n-nodes-cloudconvert.git"
+	},
+	"main": "index.js",
+	"scripts": {
+		"build": "tsc && gulp build:icons",
+		"dev": "tsc --watch",
+		"prepublishOnly": "npm run build"
+	},
+	"files": [
+		"dist"
+	],
+	"n8n": {
+		"n8nNodesApiVersion": 1,
+		"credentials": [
+			"dist/credentials/CloudConvertApi.credentials.js"
+		],
+		"nodes": [
+			"dist/nodes/CloudConvert/CloudConvert.node.js"
+		]
+	},
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"gulp": "^4.0.2",
+		"n8n-workflow": "*",
+		"typescript": "^5.0.0"
+	},
+	"peerDependencies": {
+		"n8n-workflow": "*"
+	}
+}
