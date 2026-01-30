@@ -735,6 +735,27 @@ export class CloudConvert implements INodeType {
 						default: 0,
 						description: 'DPI for conversions',
 					},
+					{
+						displayName: 'Sheet (Excel)',
+						name: 'sheet',
+						type: 'number',
+						default: 0,
+						description: 'Which sheet to convert (1-based index). Set to 0 to use all_sheets option instead.',
+					},
+					{
+						displayName: 'All Sheets (Excel)',
+						name: 'all_sheets',
+						type: 'boolean',
+						default: false,
+						description: 'Whether to convert all sheets from Excel file (creates multiple output files)',
+					},
+					{
+						displayName: 'Sheet Name (Excel)',
+						name: 'sheet_name',
+						type: 'string',
+						default: '',
+						description: 'Convert a specific sheet by name (e.g., "Sheet2"). Takes precedence over sheet number.',
+					},
 				],
 			},
 
@@ -1329,9 +1350,20 @@ export class CloudConvert implements INodeType {
 							convertTask.input_format = inputFormat;
 						}
 
-						// Add conversion options
+						// Add conversion options (handle sheet options specially)
 						for (const [key, value] of Object.entries(conversionOptions)) {
-							if (value !== '' && value !== 0 && value !== undefined) {
+							// For all_sheets, pass it even if false (explicit setting)
+							if (key === 'all_sheets') {
+								if (value === true) {
+									convertTask[key] = true;
+								}
+							} else if (key === 'sheet' && typeof value === 'number' && value > 0) {
+								// Only set sheet if it's greater than 0
+								convertTask[key] = value;
+							} else if (key === 'sheet_name' && value && value !== '') {
+								// Sheet name takes precedence
+								convertTask['sheet'] = value;
+							} else if (value !== '' && value !== 0 && value !== undefined && value !== false) {
 								convertTask[key] = value;
 							}
 						}
@@ -1364,7 +1396,43 @@ export class CloudConvert implements INodeType {
 
 							if (exportTask && (exportTask.result as IDataObject)?.files) {
 								const files = (exportTask.result as IDataObject).files as IDataObject[];
-								if (files.length > 0) {
+								
+								// Handle multiple files (e.g., from all_sheets=true)
+								if (files.length > 1) {
+									// Multiple files - create separate output items for each
+									const multiFileResults: INodeExecutionData[] = [];
+									
+									for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+										const fileData = files[fileIndex];
+										const fileUrl = fileData.url as string;
+
+										const binaryDataBuffer = await this.helpers.httpRequest({
+											method: 'GET',
+											url: fileUrl,
+											encoding: 'arraybuffer',
+										});
+
+										multiFileResults.push({
+											json: {
+												...jobData,
+												fileIndex,
+												filename: fileData.filename,
+												totalFiles: files.length,
+											},
+											binary: {
+												data: await this.helpers.prepareBinaryData(
+													Buffer.from(binaryDataBuffer),
+													fileData.filename as string,
+												),
+											},
+										});
+									}
+									
+									// Add all file results to return data
+									returnData.push(...multiFileResults);
+									continue; // Skip normal response handling
+								} else if (files.length === 1) {
+									// Single file
 									const fileData = files[0];
 									const fileUrl = fileData.url as string;
 
