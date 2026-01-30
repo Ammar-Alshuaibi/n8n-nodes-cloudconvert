@@ -18,15 +18,15 @@ import {
 
 export class CloudConvert implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'CloudConvert',
-		name: 'cloudConvert',
+		displayName: 'CloudConvert Complete',
+		name: 'cloudConvertComplete',
 		icon: 'file:cloudconvert.svg',
 		group: ['transform'],
 		version: 1,
 		subtitle: '={{$parameter["operation"] + ": " + $parameter["resource"]}}',
 		description: 'Convert files with CloudConvert API',
 		defaults: {
-			name: 'CloudConvert',
+			name: 'CloudConvert Complete',
 		},
 		inputs: ['main'],
 		outputs: ['main'],
