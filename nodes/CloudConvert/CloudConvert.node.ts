@@ -208,6 +208,12 @@ export class CloudConvert implements INodeType {
 						action: 'Create a thumbnail',
 					},
 					{
+						name: 'Get Metadata',
+						value: 'metadata',
+						description: 'Get metadata from a file (including Excel sheet names)',
+						action: 'Get file metadata',
+					},
+					{
 						name: 'Merge',
 						value: 'merge',
 						description: 'Merge multiple PDF files',
@@ -554,7 +560,7 @@ export class CloudConvert implements INodeType {
 				displayOptions: {
 					show: {
 						resource: ['file'],
-						operation: ['convert', 'thumbnail', 'watermark', 'archive'],
+						operation: ['convert', 'thumbnail', 'watermark', 'archive', 'metadata'],
 					},
 				},
 				options: [
@@ -585,7 +591,7 @@ export class CloudConvert implements INodeType {
 				displayOptions: {
 					show: {
 						resource: ['file'],
-						operation: ['convert', 'thumbnail', 'watermark', 'archive'],
+						operation: ['convert', 'thumbnail', 'watermark', 'archive', 'metadata'],
 						inputSource: ['url'],
 					},
 				},
@@ -601,7 +607,7 @@ export class CloudConvert implements INodeType {
 				displayOptions: {
 					show: {
 						resource: ['file'],
-						operation: ['convert', 'thumbnail', 'watermark', 'archive'],
+						operation: ['convert', 'thumbnail', 'watermark', 'archive', 'metadata'],
 						inputSource: ['task'],
 					},
 				},
@@ -616,7 +622,7 @@ export class CloudConvert implements INodeType {
 				displayOptions: {
 					show: {
 						resource: ['file'],
-						operation: ['convert', 'thumbnail', 'watermark', 'archive'],
+						operation: ['convert', 'thumbnail', 'watermark', 'archive', 'metadata'],
 						inputSource: ['binary'],
 					},
 				},
@@ -1805,6 +1811,105 @@ export class CloudConvert implements INodeType {
 									};
 								}
 							}
+						}
+					}
+
+					if (operation === 'metadata') {
+						const inputSource = this.getNodeParameter('inputSource', i) as string;
+
+						const tasks: IDataObject = {};
+
+						// Import task based on source
+						if (inputSource === 'url') {
+							const fileUrl = this.getNodeParameter('fileUrl', i) as string;
+							tasks['import-file'] = {
+								operation: 'import/url',
+								url: fileUrl,
+							};
+						} else if (inputSource === 'task') {
+							const inputTaskId = this.getNodeParameter('inputTaskId', i) as string;
+							tasks['import-file'] = { input: inputTaskId };
+						} else if (inputSource === 'binary') {
+							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
+							const binaryData = items[i].binary?.[binaryProperty];
+							if (!binaryData) {
+								throw new Error(`No binary data found for property "${binaryProperty}"`);
+							}
+
+							const uploadTask = await cloudConvertApiRequest.call(this, 'POST', '/import/upload');
+							const uploadTaskData = (uploadTask as IDataObject).data as IDataObject;
+							const uploadResult = uploadTaskData?.result as IDataObject;
+							const uploadForm = uploadResult?.form as IDataObject;
+							const uploadUrl = uploadForm?.url as string;
+
+							if (uploadUrl) {
+								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
+								const formData = (uploadForm?.parameters || {}) as IDataObject;
+
+								await this.helpers.httpRequest({
+									method: 'POST',
+									url: uploadUrl,
+									body: {
+										...(formData as object),
+										file: {
+											value: buffer,
+											options: {
+												filename: binaryData.fileName || 'file',
+												contentType: binaryData.mimeType,
+											},
+										},
+									},
+								});
+
+								tasks['import-file'] = {
+									operation: 'import/upload',
+								};
+							}
+						}
+
+						// Metadata task
+						tasks['get-metadata'] = {
+							operation: 'metadata',
+							input: 'import-file',
+						};
+
+						// Create the job and wait for completion
+						const jobResponse = await cloudConvertApiRequest.call(
+							this,
+							'POST',
+							'/jobs',
+							{ tasks },
+							{},
+							true, // Always wait for metadata
+						);
+
+						const jobData = (jobResponse as IDataObject).data as IDataObject;
+						const jobTasks = (jobData.tasks || []) as IDataObject[];
+						const metadataTask = jobTasks.find((t: IDataObject) => t.operation === 'metadata');
+
+						if (metadataTask && (metadataTask.result as IDataObject)?.metadata) {
+							const metadata = (metadataTask.result as IDataObject).metadata as IDataObject;
+							
+							// Extract sheets info if available (for Excel files)
+							let sheets: string[] = [];
+							if (metadata.Sheets && Array.isArray(metadata.Sheets)) {
+								sheets = metadata.Sheets as string[];
+							} else if (metadata.sheets && Array.isArray(metadata.sheets)) {
+								sheets = metadata.sheets as string[];
+							}
+
+							responseData = {
+								metadata,
+								sheets,
+								sheetCount: sheets.length,
+								// Create array of sheet objects for easy iteration
+								sheetList: sheets.map((name: string, index: number) => ({
+									index: index + 1,
+									name,
+								})),
+							};
+						} else {
+							responseData = jobResponse;
 						}
 					}
 				}
