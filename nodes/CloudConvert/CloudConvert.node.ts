@@ -1364,11 +1364,11 @@ export class CloudConvert implements INodeType {
 									convertTask[key] = true;
 								}
 							} else if (key === 'sheet' && typeof value === 'number' && value > 0) {
-								// Only set sheet if it's greater than 0
+								// Only set sheet if it's greater than 0 (1-based index)
 								convertTask[key] = value;
 							} else if (key === 'sheet_name' && value && value !== '') {
-								// Sheet name takes precedence
-								convertTask['sheet'] = value;
+								// Sheet name - use sheet_name parameter (not sheet!)
+								convertTask['sheet_name'] = value;
 							} else if (value !== '' && value !== 0 && value !== undefined && value !== false) {
 								convertTask[key] = value;
 							}
@@ -1891,8 +1891,11 @@ export class CloudConvert implements INodeType {
 							const metadata = (metadataTask.result as IDataObject).metadata as IDataObject;
 							
 							// Extract sheets info if available (for Excel files)
+							// ExifTool returns sheet names in TitlesOfParts field
 							let sheets: string[] = [];
-							if (metadata.Sheets && Array.isArray(metadata.Sheets)) {
+							if (metadata.TitlesOfParts && Array.isArray(metadata.TitlesOfParts)) {
+								sheets = metadata.TitlesOfParts as string[];
+							} else if (metadata.Sheets && Array.isArray(metadata.Sheets)) {
 								sheets = metadata.Sheets as string[];
 							} else if (metadata.sheets && Array.isArray(metadata.sheets)) {
 								sheets = metadata.sheets as string[];
