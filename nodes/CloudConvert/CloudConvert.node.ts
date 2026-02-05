@@ -1318,14 +1318,21 @@ export class CloudConvert implements INodeType {
 								url: fileUrl,
 							};
 						} else if (inputSource === 'binary') {
-							tasks['import-file'] = {
+							const importTaskPayload: IDataObject = {
 								operation: 'import/upload',
 							};
+							
+							// Add filename hint if available
+							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
+							const binaryData = items[i].binary?.[binaryProperty];
+							if (binaryData && binaryData.fileName) {
+								importTaskPayload.filename = binaryData.fileName;
+							}
+							
+							tasks['import-file'] = importTaskPayload;
 
 							// Auto-detect input format from binary filename if not provided
 							if (!inputFormat) {
-								const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
-								const binaryData = items[i].binary?.[binaryProperty];
 								if (binaryData) {
 									if (binaryData.fileName) {
 										const extension = binaryData.fileName.split('.').pop();
@@ -1401,6 +1408,8 @@ export class CloudConvert implements INodeType {
 						}
 
 						// Create the job
+						console.log('CloudConvert Create Job Payload:', JSON.stringify({ tasks }, null, 2));
+						
 						let jobResponse = await cloudConvertApiRequest.call(
 							this,
 							'POST',
