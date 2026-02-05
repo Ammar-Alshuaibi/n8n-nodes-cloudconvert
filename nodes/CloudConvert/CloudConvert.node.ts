@@ -1302,6 +1302,7 @@ export class CloudConvert implements INodeType {
 
 						// Build job with import, convert, and export tasks
 						const tasks: IDataObject = {};
+						let jobData: IDataObject = {};
 
 						const shouldWait = inputSource === 'binary' ? false : waitForCompletion;
 
@@ -1320,21 +1321,7 @@ export class CloudConvert implements INodeType {
 								url: fileUrl,
 							};
 						} else if (inputSource === 'binary') {
-							tasks['import-file'] = {
-								operation: 'import/upload',
-							};
-
-							// Auto-detect input format from binary filename if not provided
-							if (!inputFormat) {
-								const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
-								const binaryData = items[i].binary?.[binaryProperty];
-								if (binaryData && binaryData.fileName) {
-									const extension = binaryData.fileName.split('.').pop();
-									if (extension && extension.length < 5) {
-										inputFormat = extension.toLowerCase();
-									}
-								}
-							}
+							// We don't add task to 'tasks' yet, we do it in deferred flow
 						}
 
 						// Convert task
@@ -1361,32 +1348,15 @@ export class CloudConvert implements INodeType {
 							} else if (key === 'sheet_name' && value && value !== '') {
 								// Sheet name - use sheet_name parameter (not sheet!)
 								convertTask['sheet_name'] = value;
-							} else if (value !== '' && value !== 0 && value !== undefined && value !== false) {
-								convertTask[key] = value;
-							}
+						} else if (value !== null && value !== '' && value !== undefined && value !== false) {
+ 							// Strict check to avoid sending bad parameters
+							convertTask[key] = value;
 						}
+					}
 
 						tasks['convert-file'] = convertTask;
 
-						// Export task
-						tasks['export-file'] = {
-							operation: 'export/url',
-							input: 'convert-file',
-						};
-
-						// Create the job
-						let jobResponse = await cloudConvertApiRequest.call(
-							this,
-							'POST',
-							'/jobs',
-							{ tasks },
-							{},
-							shouldWait,
-						);
-
-						let jobData = (jobResponse as IDataObject).data as IDataObject;
-
-						// Handle Binary Upload
+						// Handle Binary Upload (Deferred Task Strategy)
 						if (inputSource === 'binary') {
 							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
 							const binaryData = items[i].binary?.[binaryProperty];
@@ -1394,14 +1364,29 @@ export class CloudConvert implements INodeType {
 								throw new Error(`No binary data found for property "${binaryProperty}"`);
 							}
 
-							const jobTasks = (jobData.tasks || []) as IDataObject[];
-							const importTask = jobTasks.find((t: IDataObject) => t.name === 'import-file');
+							// 1. Create Job with ONLY import/upload (and export/url is NOT added yet)
+							const importTaskPayload: IDataObject = {
+								operation: 'import/upload',
+								// Sending filename helps CloundConvert validation, but for import/upload it is not always used until upload.
+								// However, we will use deferred convert creation, so it's fine.
+							};
 							
+							const createJobResponse = await cloudConvertApiRequest.call(
+								this, 
+								'POST', 
+								'/jobs', 
+								{ tasks: { 'import-file': importTaskPayload } }
+							);
+							
+							let jobId = (createJobResponse.data as IDataObject).id as string;
+							const jobTasks = ((createJobResponse.data as IDataObject).tasks || []) as IDataObject[];
+							const importTask = jobTasks.find((t: IDataObject) => t.name === 'import-file');
+
 							if (importTask && importTask.result && (importTask.result as IDataObject).form) {
 								const form = (importTask.result as IDataObject).form as IDataObject;
 								const uploadUrl = form.url as string;
 								
-								// Upload the file
+								// 2. Upload the file
 								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
 								const formData = (form.parameters || {}) as IDataObject;
 
@@ -1419,13 +1404,51 @@ export class CloudConvert implements INodeType {
 										},
 									},
 								});
-
-								// If we need to wait, we construct a new wait request
-								if (waitForCompletion) {
-									jobResponse = await cloudConvertApiRequest.call(this, 'GET', `/jobs/${jobData.id}`, {}, {}, true);
-									jobData = (jobResponse as IDataObject).data as IDataObject;
-								}
+								
+								// 3. Add Convert and Export tasks to the existing job
+								// Now that file is uploaded, CloudConvert knows its format.
+								
+								// Reuse convertTask definition but ensure input is correct
+								const tasksToAdd: IDataObject = {
+									'convert-file': convertTask,
+									'export-file': {
+										operation: 'export/url',
+										input: 'convert-file',
+									},
+								};
+								
+								const addTasksResponse = await cloudConvertApiRequest.call(
+									this,
+									'POST',
+									`/jobs/${jobId}/tasks`,
+									{ tasks: tasksToAdd },
+									{},
+									waitForCompletion // Wait here if needed
+								);
+								
+								jobData = (addTasksResponse as IDataObject).data as IDataObject;
+								
+								// If we didn't wait, we just return the job data with new tasks
+								// If we waited, jobData is the finished job
 							}
+						} else {
+							// For URL/Task source, we do standard flow (all tasks at once)
+							
+							// Add export task
+							tasks['export-file'] = {
+								operation: 'export/url',
+								input: 'convert-file',
+							};
+
+							const jobResponse = await cloudConvertApiRequest.call(
+								this,
+								'POST',
+								'/jobs',
+								{ tasks },
+								{},
+								waitForCompletion,
+							);
+							jobData = (jobResponse as IDataObject).data as IDataObject;
 						}
 
 						responseData = { data: jobData };
