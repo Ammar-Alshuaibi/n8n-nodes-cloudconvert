@@ -16,6 +16,15 @@ import {
 	getTasks,
 } from './GenericFunctions';
 
+async function getTaskFileUrl(this: IExecuteFunctions, taskId: string): Promise<string> {
+	const taskResponse = await cloudConvertApiRequest.call(this, 'GET', `/tasks/${taskId}`);
+	const taskData = taskResponse.data;
+	if (taskData.result && taskData.result.files && taskData.result.files.length > 0) {
+		return taskData.result.files[0].url;
+	}
+	throw new Error(`The referenced task ${taskId} does not have an output file accessible via URL. Ensure it is an export task.`);
+}
+
 export class CloudConvert implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'CloudConvert Complete',
@@ -1292,6 +1301,8 @@ export class CloudConvert implements INodeType {
 						// Build job with import, convert, and export tasks
 						const tasks: IDataObject = {};
 
+						const shouldWait = inputSource === 'binary' ? false : waitForCompletion;
+
 						// Import task based on source
 						if (inputSource === 'url') {
 							const fileUrl = this.getNodeParameter('fileUrl', i) as string;
@@ -1300,49 +1311,16 @@ export class CloudConvert implements INodeType {
 								url: fileUrl,
 							};
 						} else if (inputSource === 'task') {
+							const inputTaskId = this.getNodeParameter('inputTaskId', i) as string;
+							const fileUrl = await getTaskFileUrl.call(this, inputTaskId);
 							tasks['import-file'] = {
 								operation: 'import/url',
-								url: this.getNodeParameter('inputTaskId', i),
+								url: fileUrl,
 							};
 						} else if (inputSource === 'binary') {
-							// For binary uploads, we need to handle differently
-							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
-							const binaryData = items[i].binary?.[binaryProperty];
-							if (!binaryData) {
-								throw new Error(`No binary data found for property "${binaryProperty}"`);
-							}
-
-							// First create an upload task
-							const uploadTask = await cloudConvertApiRequest.call(this, 'POST', '/import/upload');
-							const uploadTaskData = (uploadTask as IDataObject).data as IDataObject;
-							const uploadResult = uploadTaskData?.result as IDataObject;
-							const uploadForm = uploadResult?.form as IDataObject;
-							const uploadUrl = uploadForm?.url as string;
-
-							if (uploadUrl) {
-								// Upload the file
-								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
-								const formData = (uploadForm?.parameters || {}) as IDataObject;
-
-								await this.helpers.httpRequest({
-									method: 'POST',
-									url: uploadUrl,
-									body: {
-										...(formData as object),
-										file: {
-											value: buffer,
-											options: {
-												filename: binaryData.fileName || 'file',
-												contentType: binaryData.mimeType,
-											},
-										},
-									},
-								});
-
-								tasks['import-file'] = {
-									operation: 'import/upload',
-								};
-							}
+							tasks['import-file'] = {
+								operation: 'import/upload',
+							};
 						}
 
 						// Convert task
@@ -1383,85 +1361,135 @@ export class CloudConvert implements INodeType {
 						};
 
 						// Create the job
-						const jobResponse = await cloudConvertApiRequest.call(
+						let jobResponse = await cloudConvertApiRequest.call(
 							this,
 							'POST',
 							'/jobs',
 							{ tasks },
 							{},
-							waitForCompletion,
+							shouldWait,
 						);
 
-						responseData = jobResponse;
+						let jobData = (jobResponse as IDataObject).data as IDataObject;
+
+						// Handle Binary Upload
+						if (inputSource === 'binary') {
+							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
+							const binaryData = items[i].binary?.[binaryProperty];
+							if (!binaryData) {
+								throw new Error(`No binary data found for property "${binaryProperty}"`);
+							}
+
+							const jobTasks = (jobData.tasks || []) as IDataObject[];
+							const importTask = jobTasks.find((t: IDataObject) => t.name === 'import-file');
+							
+							if (importTask && importTask.result && (importTask.result as IDataObject).form) {
+								const form = (importTask.result as IDataObject).form as IDataObject;
+								const uploadUrl = form.url as string;
+								
+								// Upload the file
+								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
+								const formData = (form.parameters || {}) as IDataObject;
+
+								await this.helpers.httpRequest({
+									method: 'POST',
+									url: uploadUrl,
+									body: {
+										...(formData as object),
+										file: {
+											value: buffer,
+											options: {
+												filename: binaryData.fileName || 'file',
+												contentType: binaryData.mimeType,
+											},
+										},
+									},
+								});
+
+								// If we need to wait, we construct a new wait request
+								if (waitForCompletion) {
+									jobResponse = await cloudConvertApiRequest.call(this, 'GET', `/jobs/${jobData.id}`, {}, {}, true);
+									jobData = (jobResponse as IDataObject).data as IDataObject;
+								}
+							}
+						}
+
+						responseData = { data: jobData };
 
 						// Download result if requested
-						if (downloadResult && (jobResponse as IDataObject).data) {
-							const jobData = (jobResponse as IDataObject).data as IDataObject;
-							const jobTasks = (jobData.tasks || []) as IDataObject[];
-							const exportTask = jobTasks.find((t: IDataObject) => t.operation === 'export/url');
-
-							if (exportTask && (exportTask.result as IDataObject)?.files) {
-								const files = (exportTask.result as IDataObject).files as IDataObject[];
-								
-								// Handle multiple files (e.g., from all_sheets=true)
-								if (files.length > 1) {
-									// Multiple files - create separate output items for each
-									const multiFileResults: INodeExecutionData[] = [];
+						if (downloadResult) {
+							// Check status first
+							if (jobData.status === 'finished') {
+								const jobTasks = (jobData.tasks || []) as IDataObject[];
+								const exportTask = jobTasks.find((t: IDataObject) => t.operation === 'export/url');
+	
+								if (exportTask && (exportTask.result as IDataObject)?.files) {
+									const files = (exportTask.result as IDataObject).files as IDataObject[];
 									
-									for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
-										const fileData = files[fileIndex];
+									// Handle multiple files (e.g., from all_sheets=true)
+									if (files.length > 1) {
+										// Multiple files - create separate output items for each
+										const multiFileResults: INodeExecutionData[] = [];
+										
+										for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+											const fileData = files[fileIndex];
+											const fileUrl = fileData.url as string;
+	
+											const binaryDataBuffer = await this.helpers.httpRequest({
+												method: 'GET',
+												url: fileUrl,
+												encoding: 'arraybuffer',
+											});
+	
+											multiFileResults.push({
+												json: {
+													...jobData,
+													fileIndex,
+													filename: fileData.filename,
+													totalFiles: files.length,
+												},
+												binary: {
+													data: await this.helpers.prepareBinaryData(
+														Buffer.from(binaryDataBuffer),
+														fileData.filename as string,
+													),
+												},
+											});
+										}
+										
+										// Add all file results to return data
+										returnData.push(...multiFileResults);
+										continue; // Skip normal response handling
+									} else if (files.length === 1) {
+										// Single file
+										const fileData = files[0];
 										const fileUrl = fileData.url as string;
-
-										const binaryDataBuffer = await this.helpers.httpRequest({
+	
+										const binaryData = await this.helpers.httpRequest({
 											method: 'GET',
 											url: fileUrl,
 											encoding: 'arraybuffer',
 										});
-
-										multiFileResults.push({
-											json: {
-												...jobData,
-												fileIndex,
-												filename: fileData.filename,
-												totalFiles: files.length,
-											},
+	
+										responseData = {
+											...jobData,
 											binary: {
 												data: await this.helpers.prepareBinaryData(
-													Buffer.from(binaryDataBuffer),
+													Buffer.from(binaryData),
 													fileData.filename as string,
 												),
 											},
-										});
+										};
 									}
-									
-									// Add all file results to return data
-									returnData.push(...multiFileResults);
-									continue; // Skip normal response handling
-								} else if (files.length === 1) {
-									// Single file
-									const fileData = files[0];
-									const fileUrl = fileData.url as string;
-
-									const binaryData = await this.helpers.httpRequest({
-										method: 'GET',
-										url: fileUrl,
-										encoding: 'arraybuffer',
-									});
-
-									responseData = {
-										...jobData,
-										binary: {
-											data: await this.helpers.prepareBinaryData(
-												Buffer.from(binaryData),
-												fileData.filename as string,
-											),
-										},
-									};
 								}
+							} else {
+								// Job not finished (maybe error), just return JSON
+								responseData = { data: jobData };
 							}
+						} else {
+							responseData = jobData; // Just return request data
 						}
 					}
-
 					if (operation === 'captureWebsite') {
 						const websiteUrl = this.getNodeParameter('websiteUrl', i) as string;
 						const captureFormat = this.getNodeParameter('captureFormat', i) as string;
@@ -1533,6 +1561,7 @@ export class CloudConvert implements INodeType {
 						const thumbnailOptions = this.getNodeParameter('thumbnailOptions', i) as IDataObject;
 
 						const tasks: IDataObject = {};
+						const shouldWait = inputSource === 'binary' ? false : waitForCompletion;
 
 						if (inputSource === 'url') {
 							const fileUrl = this.getNodeParameter('fileUrl', i) as string;
@@ -1542,7 +1571,15 @@ export class CloudConvert implements INodeType {
 							};
 						} else if (inputSource === 'task') {
 							const inputTaskId = this.getNodeParameter('inputTaskId', i) as string;
-							tasks['import'] = { input: inputTaskId };
+							const fileUrl = await getTaskFileUrl.call(this, inputTaskId);
+							tasks['import'] = {
+								operation: 'import/url',
+								url: fileUrl,
+							};
+						} else if (inputSource === 'binary') {
+							tasks['import'] = {
+								operation: 'import/upload',
+							};
 						}
 
 						tasks['thumbnail'] = {
@@ -1557,19 +1594,59 @@ export class CloudConvert implements INodeType {
 							input: 'thumbnail',
 						};
 
-						const jobResponse = await cloudConvertApiRequest.call(
+						let jobResponse = await cloudConvertApiRequest.call(
 							this,
 							'POST',
 							'/jobs',
 							{ tasks },
 							{},
-							waitForCompletion,
+							shouldWait,
 						);
 
-						responseData = jobResponse;
+						let jobData = (jobResponse as IDataObject).data as IDataObject;
 
-						if (downloadResult) {
-							const jobData = (jobResponse as IDataObject).data as IDataObject;
+						// Handle Binary Upload
+						if (inputSource === 'binary') {
+							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
+							const binaryData = items[i].binary?.[binaryProperty];
+							if (!binaryData) {
+								throw new Error(`No binary data found for property "${binaryProperty}"`);
+							}
+
+							const jobTasks = (jobData.tasks || []) as IDataObject[];
+							const importTask = jobTasks.find((t: IDataObject) => t.name === 'import');
+							
+							if (importTask && importTask.result && (importTask.result as IDataObject).form) {
+								const form = (importTask.result as IDataObject).form as IDataObject;
+								const uploadUrl = form.url as string;
+								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
+								const formData = (form.parameters || {}) as IDataObject;
+
+								await this.helpers.httpRequest({
+									method: 'POST',
+									url: uploadUrl,
+									body: {
+										...(formData as object),
+										file: {
+											value: buffer,
+											options: {
+												filename: binaryData.fileName || 'file',
+												contentType: binaryData.mimeType,
+											},
+										},
+									},
+								});
+
+								if (waitForCompletion) {
+									jobResponse = await cloudConvertApiRequest.call(this, 'GET', `/jobs/${jobData.id}`, {}, {}, true);
+									jobData = (jobResponse as IDataObject).data as IDataObject;
+								}
+							}
+						}
+
+						responseData = jobData;
+
+						if (downloadResult && jobData.status === 'finished') {
 							const jobTasks = (jobData.tasks || []) as IDataObject[];
 							const exportTask = jobTasks.find((t: IDataObject) => t.operation === 'export/url');
 
@@ -1608,12 +1685,24 @@ export class CloudConvert implements INodeType {
 						const watermarkOptions = this.getNodeParameter('watermarkOptions', i) as IDataObject;
 
 						const tasks: IDataObject = {};
+						const shouldWait = inputSource === 'binary' ? false : waitForCompletion;
 
 						if (inputSource === 'url') {
 							const fileUrl = this.getNodeParameter('fileUrl', i) as string;
 							tasks['import'] = {
 								operation: 'import/url',
 								url: fileUrl,
+							};
+						} else if (inputSource === 'task') {
+							const inputTaskId = this.getNodeParameter('inputTaskId', i) as string;
+							const fileUrl = await getTaskFileUrl.call(this, inputTaskId);
+							tasks['import'] = {
+								operation: 'import/url',
+								url: fileUrl,
+							};
+						} else if (inputSource === 'binary') {
+							tasks['import'] = {
+								operation: 'import/upload',
 							};
 						}
 
@@ -1642,19 +1731,60 @@ export class CloudConvert implements INodeType {
 							input: 'watermark',
 						};
 
-						const jobResponse = await cloudConvertApiRequest.call(
+						let jobResponse = await cloudConvertApiRequest.call(
 							this,
 							'POST',
 							'/jobs',
 							{ tasks },
 							{},
-							waitForCompletion,
+							shouldWait,
 						);
 
-						responseData = jobResponse;
+						let jobData = (jobResponse as IDataObject).data as IDataObject;
 
-						if (downloadResult) {
-							const jobData = (jobResponse as IDataObject).data as IDataObject;
+						// Handle Binary Upload
+						if (inputSource === 'binary') {
+							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
+							const binaryData = items[i].binary?.[binaryProperty];
+							if (!binaryData) {
+								throw new Error(`No binary data found for property "${binaryProperty}"`);
+							}
+
+							const jobTasks = (jobData.tasks || []) as IDataObject[];
+							const importTask = jobTasks.find((t: IDataObject) => t.name === 'import');
+							
+							if (importTask && importTask.result && (importTask.result as IDataObject).form) {
+								const form = (importTask.result as IDataObject).form as IDataObject;
+								const uploadUrl = form.url as string;
+								
+								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
+								const formData = (form.parameters || {}) as IDataObject;
+
+								await this.helpers.httpRequest({
+									method: 'POST',
+									url: uploadUrl,
+									body: {
+										...(formData as object),
+										file: {
+											value: buffer,
+											options: {
+												filename: binaryData.fileName || 'file',
+												contentType: binaryData.mimeType,
+											},
+										},
+									},
+								});
+
+								if (waitForCompletion) {
+									jobResponse = await cloudConvertApiRequest.call(this, 'GET', `/jobs/${jobData.id}`, {}, {}, true);
+									jobData = (jobResponse as IDataObject).data as IDataObject;
+								}
+							}
+						}
+
+						responseData = jobData;
+
+						if (downloadResult && jobData.status === 'finished') {
 							const jobTasks = (jobData.tasks || []) as IDataObject[];
 							const exportTask = jobTasks.find((t: IDataObject) => t.operation === 'export/url');
 
@@ -1752,12 +1882,24 @@ export class CloudConvert implements INodeType {
 						const downloadResult = waitForCompletion && this.getNodeParameter('downloadResult', i, false) as boolean;
 
 						const tasks: IDataObject = {};
+						const shouldWait = inputSource === 'binary' ? false : waitForCompletion;
 
 						if (inputSource === 'url') {
 							const fileUrl = this.getNodeParameter('fileUrl', i) as string;
 							tasks['import'] = {
 								operation: 'import/url',
 								url: fileUrl,
+							};
+						} else if (inputSource === 'task') {
+							const inputTaskId = this.getNodeParameter('inputTaskId', i) as string;
+							const fileUrl = await getTaskFileUrl.call(this, inputTaskId);
+							tasks['import'] = {
+								operation: 'import/url',
+								url: fileUrl,
+							};
+						} else if (inputSource === 'binary') {
+							tasks['import'] = {
+								operation: 'import/upload',
 							};
 						}
 
@@ -1772,19 +1914,60 @@ export class CloudConvert implements INodeType {
 							input: 'archive',
 						};
 
-						const jobResponse = await cloudConvertApiRequest.call(
+						let jobResponse = await cloudConvertApiRequest.call(
 							this,
 							'POST',
 							'/jobs',
 							{ tasks },
 							{},
-							waitForCompletion,
+							shouldWait,
 						);
 
-						responseData = jobResponse;
+						let jobData = (jobResponse as IDataObject).data as IDataObject;
 
-						if (downloadResult) {
-							const jobData = (jobResponse as IDataObject).data as IDataObject;
+						// Handle Binary Upload
+						if (inputSource === 'binary') {
+							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
+							const binaryData = items[i].binary?.[binaryProperty];
+							if (!binaryData) {
+								throw new Error(`No binary data found for property "${binaryProperty}"`);
+							}
+
+							const jobTasks = (jobData.tasks || []) as IDataObject[];
+							const importTask = jobTasks.find((t: IDataObject) => t.name === 'import');
+							
+							if (importTask && importTask.result && (importTask.result as IDataObject).form) {
+								const form = (importTask.result as IDataObject).form as IDataObject;
+								const uploadUrl = form.url as string;
+								
+								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
+								const formData = (form.parameters || {}) as IDataObject;
+
+								await this.helpers.httpRequest({
+									method: 'POST',
+									url: uploadUrl,
+									body: {
+										...(formData as object),
+										file: {
+											value: buffer,
+											options: {
+												filename: binaryData.fileName || 'file',
+												contentType: binaryData.mimeType,
+											},
+										},
+									},
+								});
+
+								if (waitForCompletion) {
+									jobResponse = await cloudConvertApiRequest.call(this, 'GET', `/jobs/${jobData.id}`, {}, {}, true);
+									jobData = (jobResponse as IDataObject).data as IDataObject;
+								}
+							}
+						}
+
+						responseData = jobData;
+
+						if (downloadResult && jobData.status === 'finished') {
 							const jobTasks = (jobData.tasks || []) as IDataObject[];
 							const exportTask = jobTasks.find((t: IDataObject) => t.operation === 'export/url');
 
@@ -1818,6 +2001,10 @@ export class CloudConvert implements INodeType {
 						const inputSource = this.getNodeParameter('inputSource', i) as string;
 
 						const tasks: IDataObject = {};
+						// Always wait for metadata is default, but for binary we must wait after upload
+						// The original code passed `true` (always wait).
+						// So we set shouldWait = true, UNLESS binary.
+						const shouldWait = inputSource === 'binary' ? false : true;
 
 						// Import task based on source
 						if (inputSource === 'url') {
@@ -1828,23 +2015,52 @@ export class CloudConvert implements INodeType {
 							};
 						} else if (inputSource === 'task') {
 							const inputTaskId = this.getNodeParameter('inputTaskId', i) as string;
-							tasks['import-file'] = { input: inputTaskId };
+							const fileUrl = await getTaskFileUrl.call(this, inputTaskId);
+							tasks['import-file'] = {
+								operation: 'import/url',
+								url: fileUrl,
+							};
 						} else if (inputSource === 'binary') {
+							tasks['import-file'] = {
+								operation: 'import/upload',
+							};
+						}
+
+						// Metadata task
+						tasks['get-metadata'] = {
+							operation: 'metadata',
+							input: 'import-file',
+						};
+
+						// Create the job and wait for completion
+						let jobResponse = await cloudConvertApiRequest.call(
+							this,
+							'POST',
+							'/jobs',
+							{ tasks },
+							{},
+							shouldWait, 
+						);
+
+						let jobData = (jobResponse as IDataObject).data as IDataObject;
+
+						// Handle Binary Upload
+						if (inputSource === 'binary') {
 							const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
 							const binaryData = items[i].binary?.[binaryProperty];
 							if (!binaryData) {
 								throw new Error(`No binary data found for property "${binaryProperty}"`);
 							}
 
-							const uploadTask = await cloudConvertApiRequest.call(this, 'POST', '/import/upload');
-							const uploadTaskData = (uploadTask as IDataObject).data as IDataObject;
-							const uploadResult = uploadTaskData?.result as IDataObject;
-							const uploadForm = uploadResult?.form as IDataObject;
-							const uploadUrl = uploadForm?.url as string;
-
-							if (uploadUrl) {
+							const jobTasks = (jobData.tasks || []) as IDataObject[];
+							const importTask = jobTasks.find((t: IDataObject) => t.name === 'import-file'); // Metadata uses import-file
+							
+							if (importTask && importTask.result && (importTask.result as IDataObject).form) {
+								const form = (importTask.result as IDataObject).form as IDataObject;
+								const uploadUrl = form.url as string;
+								
 								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
-								const formData = (uploadForm?.parameters || {}) as IDataObject;
+								const formData = (form.parameters || {}) as IDataObject;
 
 								await this.helpers.httpRequest({
 									method: 'POST',
@@ -1861,29 +2077,12 @@ export class CloudConvert implements INodeType {
 									},
 								});
 
-								tasks['import-file'] = {
-									operation: 'import/upload',
-								};
+								// ALWAYS wait for metadata after upload
+								jobResponse = await cloudConvertApiRequest.call(this, 'GET', `/jobs/${jobData.id}`, {}, {}, true);
+								jobData = (jobResponse as IDataObject).data as IDataObject;
 							}
 						}
 
-						// Metadata task
-						tasks['get-metadata'] = {
-							operation: 'metadata',
-							input: 'import-file',
-						};
-
-						// Create the job and wait for completion
-						const jobResponse = await cloudConvertApiRequest.call(
-							this,
-							'POST',
-							'/jobs',
-							{ tasks },
-							{},
-							true, // Always wait for metadata
-						);
-
-						const jobData = (jobResponse as IDataObject).data as IDataObject;
 						const jobTasks = (jobData.tasks || []) as IDataObject[];
 						const metadataTask = jobTasks.find((t: IDataObject) => t.operation === 'metadata');
 
@@ -1912,7 +2111,7 @@ export class CloudConvert implements INodeType {
 								})),
 							};
 						} else {
-							responseData = jobResponse;
+							responseData = jobData;
 						}
 					}
 				}
