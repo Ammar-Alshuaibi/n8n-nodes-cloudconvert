@@ -1319,8 +1319,36 @@ export class CloudConvert implements INodeType {
 								url: fileUrl,
 							};
 						} else if (inputSource === 'binary') {
-							// Deferred strategy: We do NOT add the task to the initial 'tasks' object here.
-							// It will be created in the specialized block below.
+							// Auto-detect input format from binary filename if not provided
+							if (!inputFormat) {
+								const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
+								const binaryData = items[i].binary?.[binaryProperty];
+								if (binaryData) {
+									if (binaryData.fileName) {
+										const extension = binaryData.fileName.split('.').pop();
+										if (extension && extension.length < 10 && extension !== binaryData.fileName) {
+											inputFormat = extension.toLowerCase();
+										}
+									}
+									// Fallback to Mime Type if still empty
+									if (!inputFormat && binaryData.mimeType) {
+										const mimeMap: { [key: string]: string } = {
+											'application/pdf': 'pdf',
+											'image/jpeg': 'jpg',
+											'image/png': 'png',
+											'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+											'application/vnd.ms-excel': 'xls',
+											'text/csv': 'csv',
+											'application/json': 'json',
+											'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+											'application/msword': 'doc',
+										};
+										if (mimeMap[binaryData.mimeType]) {
+											inputFormat = mimeMap[binaryData.mimeType];
+										}
+									}
+								}
+							}
 						}
 
 						// Convert task
@@ -1363,15 +1391,15 @@ export class CloudConvert implements INodeType {
 								throw new Error(`No binary data found for property "${binaryProperty}"`);
 							}
 
-							// 1. Create Job with ONLY import/upload (and export/url is NOT added yet)
+							// 1. Create Job with ONLY import/upload
 							const importTaskPayload: IDataObject = {
 								operation: 'import/upload',
 							};
-							
-							// Add filename hint if available - helpful for some integrations, though CC mainly uses upload filename
 							if (binaryData.fileName) {
 								importTaskPayload.filename = binaryData.fileName;
 							}
+
+							console.log('CloudConvert (Binary) Create Job Payload:', JSON.stringify({ tasks: { 'import-file': importTaskPayload } }, null, 2));
 							
 							const createJobResponse = await cloudConvertApiRequest.call(
 								this, 
@@ -1391,6 +1419,8 @@ export class CloudConvert implements INodeType {
 								// 2. Upload the file
 								const buffer = await this.helpers.getBinaryDataBuffer(i, binaryProperty);
 								const formData = (form.parameters || {}) as IDataObject;
+								
+								console.log('CloudConvert (Binary) Uploading file to:', uploadUrl);
 
 								await this.helpers.httpRequest({
 									method: 'POST',
@@ -1407,8 +1437,7 @@ export class CloudConvert implements INodeType {
 									},
 								});
 								
-								// 3. Add Convert and Export tasks to the existing job
-								// Now that file is uploaded, CloudConvert knows its format.
+								// 3. Add Convert and Export tasks
 								
 								const tasksToAdd: IDataObject = {
 									'convert-file': convertTask,
@@ -1418,13 +1447,15 @@ export class CloudConvert implements INodeType {
 									},
 								};
 								
+								console.log('CloudConvert (Binary) Add Tasks Payload:', JSON.stringify({ tasks: tasksToAdd }, null, 2));
+								
 								const addTasksResponse = await cloudConvertApiRequest.call(
 									this,
 									'POST',
 									`/jobs/${jobId}/tasks`,
 									{ tasks: tasksToAdd },
 									{},
-									waitForCompletion // Wait here if needed
+									waitForCompletion
 								);
 								
 								jobData = (addTasksResponse as IDataObject).data as IDataObject;
