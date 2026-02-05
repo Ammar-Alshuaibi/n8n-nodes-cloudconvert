@@ -6,7 +6,9 @@ import type {
 	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
+	JsonObject,
 } from 'n8n-workflow';
+import { NodeApiError } from 'n8n-workflow';
 
 import {
 	cloudConvertApiRequest,
@@ -2153,7 +2155,7 @@ export class CloudConvert implements INodeType {
 					returnData.push(...executionData);
 					continue;
 				}
-				throw error;
+				throw new NodeApiError(this.getNode(), error as JsonObject);
 			}
 		}
 
