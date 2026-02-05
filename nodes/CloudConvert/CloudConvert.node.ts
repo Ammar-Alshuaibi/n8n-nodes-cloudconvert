@@ -1295,7 +1295,7 @@ export class CloudConvert implements INodeType {
 					if (operation === 'convert') {
 						const inputSource = this.getNodeParameter('inputSource', i) as string;
 						const outputFormat = this.getNodeParameter('outputFormat', i) as string;
-						const inputFormat = this.getNodeParameter('inputFormat', i, '') as string;
+						let inputFormat = this.getNodeParameter('inputFormat', i, '') as string;
 						const waitForCompletion = this.getNodeParameter('waitForCompletion', i) as boolean;
 						const downloadResult = waitForCompletion && this.getNodeParameter('downloadResult', i, false) as boolean;
 						const conversionOptions = this.getNodeParameter('conversionOptions', i) as IDataObject;
@@ -1323,6 +1323,18 @@ export class CloudConvert implements INodeType {
 							tasks['import-file'] = {
 								operation: 'import/upload',
 							};
+
+							// Auto-detect input format from binary filename if not provided
+							if (!inputFormat) {
+								const binaryProperty = this.getNodeParameter('binaryProperty', i) as string;
+								const binaryData = items[i].binary?.[binaryProperty];
+								if (binaryData && binaryData.fileName) {
+									const extension = binaryData.fileName.split('.').pop();
+									if (extension && extension.length < 5) {
+										inputFormat = extension.toLowerCase();
+									}
+								}
+							}
 						}
 
 						// Convert task
